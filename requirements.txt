@@ -1,0 +1,28 @@
+# --- Core Computer Vision & Landmarks ---
+mediapipe==0.10.35
+opencv-python==4.10.0.84
+
+# --- Deep Learning Stack (CUDA 12.6+ Compatible) ---
+# Note: These versions are optimized for RTX 20-series and newer
+torch==2.7.0
+torchvision==0.22.0
+pytorch-lightning==2.5.0
+
+# --- Data Processing & Math ---
+numpy==1.26.4
+pandas==2.2.2
+scikit-learn==1.5.0
+scipy==1.13.1
+
+# --- Performance & Deployment ---
+onnx==1.16.1
+onnxruntime-gpu==1.18.0
+
+# --- Real-Time Interface & API ---
+fastapi==0.111.0
+uvicorn==0.30.1
+python-multipart==0.0.9
+
+# --- Visualization & Logging ---
+matplotlib==3.9.0
+tqdm==4.66.4
