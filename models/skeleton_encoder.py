@@ -19,71 +19,74 @@ class PositionalEncoding(nn.Module):
 
 class SkeletonEncoder(nn.Module):
     """
-    Dense Temporal Encoder for masked skeleton reconstruction.
+    v5 Kinetic Encoder — Dense Temporal Transformer with 9-channel input.
+
+    Input channels (per landmark per frame):
+        0:3  — position  (x, y, z)
+        3:6  — velocity  (Gaussian-smoothed frame deltas)
+        6:9  — acceleration (Gaussian-smoothed 2nd-order deltas)
 
     Shape contract (NO global pooling anywhere):
-        Input  : (B, T, V, C)   e.g. (B, 60, 543, 3)
+        Input  : (B, T, V, 9)   e.g. (B, 60, 543, 9)
         Encoded: (B, T, hidden)  — temporal dim is FULLY PRESERVED
-        Output : (B, T, V, C)   — pointwise reconstruction per frame
+        Output : (B, T, V, 9)   — pointwise prediction per frame
 
-    Frame 5 of the latent is used ONLY to predict Frame 5 coordinates.
-    The Reconstruction Head is applied identically to every time-step via
-    the Linear layers, which act as a shared 1×1 convolution over time.
+    The Reconstruction Head acts as a shared 1×1 conv over T:
+        frame t hidden state → all 9 channels for frame t.
     """
 
-    def __init__(self, num_nodes=543, in_channels=3, hidden_dim=512,
-                 num_layers=4, nhead=8):
+    def __init__(self, num_nodes=543, in_channels=9, hidden_dim=512,
+                 num_layers=4, nhead=16):
         super(SkeletonEncoder, self).__init__()
+        assert hidden_dim % nhead == 0, \
+            f"hidden_dim ({hidden_dim}) must be divisible by nhead ({nhead})"
+
         self.num_nodes   = num_nodes
         self.in_channels = in_channels
-        self.input_dim   = num_nodes * in_channels  # 1629
+        self.input_dim   = num_nodes * in_channels  # 543 * 9 = 4887
 
         # ── Spatial Projection ────────────────────────────────────────────────
-        # Maps (B, T, 1629) → (B, T, hidden_dim).  NO pooling over T.
+        # Maps (B, T, 4887) → (B, T, hidden_dim).  NO pooling over T.
         self.spatial_proj = nn.Linear(self.input_dim, hidden_dim)
 
         # ── Positional Encoding ───────────────────────────────────────────────
         self.pos_encoder = PositionalEncoding(hidden_dim, max_len=60)
 
-        # ── Dense Temporal Encoder (Transformer) ──────────────────────────────
-        # batch_first=True → input/output shape: (B, T, hidden_dim).
-        # dropout=0.5: heavy regularization forces the model to NOT rely on
-        # any single attention head — it must distribute learning across all.
+        # ── Dense Temporal Encoder (Transformer, 16 heads) ────────────────────
+        # 16 heads × 32 head_dim = 512. Extra heads distribute attention across
+        # position, velocity, and acceleration sub-spaces simultaneously.
+        # dropout=0.3: lighter than v4 (0.5) — we have richer input features now
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=hidden_dim,
             nhead=nhead,
             dim_feedforward=hidden_dim * 4,
-            dropout=0.5,             # Blindfold regularization
+            dropout=0.3,
             batch_first=True,
             activation="gelu",
             norm_first=True,
         )
         self.temporal_encoder = nn.TransformerEncoder(
             encoder_layer, num_layers=num_layers,
-            enable_nested_tensor=False   # norm_first=True is incompatible with nested tensors
+            enable_nested_tensor=False
         )
 
         # ── Pointwise Reconstruction Head (Lean Bottleneck) ───────────────────
-        # Bottleneck at 256 units prevents the model from hiding in a flat
-        # local minimum via over-parameterization. It must compress the
-        # hidden state down and reconstruct hand coords from scratch.
+        # Predicts all 9 output channels (pos + vel + acc) from hidden state.
+        # 256-unit bottleneck forces compression; can't memorize, must generalize.
         BOTTLENECK = 256
         self.reconstruction_head = nn.Sequential(
             nn.Linear(hidden_dim, BOTTLENECK),
             nn.GELU(),
-            nn.Dropout(0.3),             # Additional regularization at decode
+            nn.Dropout(0.2),
             nn.Linear(BOTTLENECK, BOTTLENECK),
             nn.GELU(),
             nn.Linear(BOTTLENECK, self.input_dim),
         )
-        self._init_recon_head()
 
-        # ── Orthogonal Initialization for Temporal Layers ─────────────────────
-        # Orthogonal weights preserve signal norms over long sequences, keeping
-        # motion gradients alive through all 60 frames.
+        # ── Initialization ────────────────────────────────────────────────────
+        self._init_recon_head()
         self._init_temporal_orthogonal()
 
-    # ─────────────────────────────────────────────────────────────────────────
     def _init_recon_head(self):
         """Kaiming Normal for the coordinate regression head."""
         for layer in self.reconstruction_head:
@@ -93,57 +96,50 @@ class SkeletonEncoder(nn.Module):
 
     def _init_temporal_orthogonal(self):
         """
-        Orthogonal initialization for all Linear sub-layers inside the
-        TransformerEncoder (attention projections + FFN).  Orthogonal
-        matrices are norm-preserving: ||Wx|| = ||x||, so gradients neither
-        explode nor vanish when back-propagating through 60 attention steps.
+        Orthogonal init for all Linear layers in the temporal encoder.
+        Norm-preserving: ‖Wx‖ = ‖x‖ — keeps kinetic signals alive over 60 steps.
         """
         for module in self.temporal_encoder.modules():
             if isinstance(module, nn.Linear):
                 nn.init.orthogonal_(module.weight)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
-        # Also apply to spatial projection (feeds into temporal stack)
         nn.init.orthogonal_(self.spatial_proj.weight)
         nn.init.zeros_(self.spatial_proj.bias)
 
-    # ─────────────────────────────────────────────────────────────────────────
     def forward(self, x):
         """
-        x : (B, T, V, C)   e.g. (B, 60, 543, 3) — masked skeleton windows
-        Returns reconstructed tensor of the same shape.
+        x : (B, T, V, 9)  — masked kinetic tensor (hands zeroed)
+        Returns: (B, T, V, 9) — reconstructed kinetic tensor
         """
         B, T, V, C = x.size()
 
-        # (B, T, V, C) → (B, T, V*C)  — spatial flatten, T is untouched
+        # Flatten spatial: (B, T, V*9)
         x_flat = x.view(B, T, V * C)
 
-        # (B, T, V*C) → (B, T, hidden_dim)
+        # Project to hidden: (B, T, hidden_dim)
         x = self.spatial_proj(x_flat)
 
-        # Add per-frame positional signal
+        # Temporal position signal
         x = self.pos_encoder(x)
 
-        # Dense temporal attention: (B, T, hidden) → (B, T, hidden)
-        # Shape is FULLY PRESERVED — no pooling, no squeeze over T
+        # Dense attention — shape preserved: (B, T, hidden_dim)
         x = self.temporal_encoder(x)
 
-        # Pointwise decode: each frame's hidden state → that frame's coords
-        # Linear operates on last dim only, so T is still preserved
-        out = self.reconstruction_head(x)  # (B, T, V*C)
+        # Pointwise decode: hidden[t] → all 9 channels for frame t
+        out = self.reconstruction_head(x)  # (B, T, V*9)
 
-        # Reshape to original spatial structure
-        return out.view(B, T, V, C)        # (B, T, V, C)
+        return out.view(B, T, V, C)         # (B, T, V, 9)
 
 
 # ─── Sanity check ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     model = SkeletonEncoder()
-    dummy  = torch.randn(2, 60, 543, 3)
+    dummy  = torch.randn(2, 60, 543, 9)
     out    = model(dummy)
 
     print(f"Input  shape : {dummy.shape}")
     print(f"Output shape : {out.shape}")
     print(f"Parameters   : {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
     assert out.shape == dummy.shape, "Shape mismatch!"
-    print("Shape contract OK — temporal dim fully preserved.")
+    print("Shape contract OK — (B, 60, 543, 9) preserved end-to-end.")

@@ -15,10 +15,11 @@ from matplotlib.collections import LineCollection
 base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 sys.path.append(base_dir)
 from models.skeleton_encoder import SkeletonEncoder
+from scripts.dataset import compute_kinetic_features
 
 # ─── Config ───────────────────────────────────────────────────────────────────
-MODEL_PATH  = os.path.join(base_dir, "models", "ssl_encoder_v4_final.pth")
-OUTPUT_PATH = os.path.join(base_dir, "reconstruction_v4_blindfold.mp4")
+MODEL_PATH  = os.path.join(base_dir, "models", "ssl_encoder_v5_final.pth")
+OUTPUT_PATH = os.path.join(base_dir, "reconstruction_v5_kinetic.mp4")
 FPS         = 30
 DURATION_S  = 8
 N_FRAMES    = FPS * DURATION_S   # 240 frames
@@ -66,8 +67,8 @@ def draw_hand_skeleton(ax, landmarks_xy, color, lw=1.2, alpha=1.0, offset=0):
 
 def main():
     print("=" * 60)
-    print("   RECONSTRUCTION VISUALIZATION v4 — The Blindfold Engine")
-    print("   (100% Hand Masking | Hallucination from Arms Only)")
+    print("   RECONSTRUCTION VISUALIZATION v5 — The Kinetic Engine")
+    print("   (9-channel: pos+vel+acc | 100% Hand Blindfold | 16 Attn Heads)")
     print("=" * 60)
 
     # ── Load model ────────────────────────────────────────────────
@@ -75,7 +76,7 @@ def main():
     if not os.path.exists(MODEL_PATH):
         print(f"ERROR: Model not found: {MODEL_PATH}")
         return
-    model = SkeletonEncoder().to(device)
+    model = SkeletonEncoder(in_channels=9, nhead=16).to(device)
     model.load_state_dict(torch.load(MODEL_PATH, map_location=device, weights_only=True))
     model.eval()
     print(f"Model loaded: {MODEL_PATH}")
@@ -101,17 +102,20 @@ def main():
     start     = random.randint(0, full_data.shape[0] - N_FRAMES)
     data      = full_data[start:start + N_FRAMES].copy()  # (240, 543, 3)
 
-    # ── Masked inference ──────────────────────────────────────────
-    masked = data.copy()
-    # TOTAL BLINDFOLD at inference: matches training conditions exactly.
-    # Hands (501:543) are zeroed in ALL 60 frames — model must hallucinate
-    # purely from Elbows/Shoulders (468:500) and full body context.
-    masked[:, 501:543, :] = 0.0
-    batched = masked.reshape(N_FRAMES // 60, 60, 543, 3)
+    # Build 9-channel kinetic features from raw position data
+    # Apply total blindfold: zero all 9 channels of hands in every frame
+    kinetic_full   = compute_kinetic_features(data)      # (240, 543, 9)
+    kinetic_masked = kinetic_full.copy()
+    kinetic_masked[:, 501:543, :] = 0.0                  # 100% blindfold
+
+    batched = kinetic_masked.reshape(N_FRAMES // 60, 60, 543, 9)
     tensor  = torch.tensor(batched, dtype=torch.float32).to(device)
 
     with torch.no_grad():
-        recon = model(tensor).cpu().numpy().reshape(N_FRAMES, 543, 3)
+        recon_9d = model(tensor).cpu().numpy().reshape(N_FRAMES, 543, 9)
+
+    # Extract position channels (0:3) for visualization — (240, 543, 3)
+    recon = recon_9d[:, :, 0:3]
 
     print("Inference complete.")
 
@@ -150,7 +154,7 @@ def main():
                         color='white', fontsize=11, pad=8)
 
     fig.suptitle(
-        "Reconstruction v4: The Blindfold Engine — Hallucination from Arms Only",
+        "Reconstruction v5: The Kinetic Engine — pos+vel+acc Hallucination",
         color='white', fontsize=13, fontweight='bold', y=0.97
     )
 
